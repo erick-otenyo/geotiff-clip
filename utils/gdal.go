@@ -79,3 +79,15 @@ func registerGDALDrivers() {
 	// Now register everything else
 	C.GDALAllRegister()
 }
+
+func GetDataType(gdalDataType int) string {
+	var GDALTypes = map[int]string{1: "Byte", 2: "UInt16", 3: "Int16",
+		4: "UInt32", 5: "Int32", 6: "Float32", 7: "Float64"}
+
+	dt, found := GDALTypes[gdalDataType]
+	if !found {
+		return ""
+	}
+
+	return dt
+}

@@ -1,0 +1,87 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/erick-otenyo/geotiff-clip/utils"
+	"github.com/schollz/progressbar/v3"
+)
+
+func main() {
+
+	// filePath := flag.String("f", "", "File Path")
+	// geomPath := flag.String("g", "", "Geom Path")
+	// outPath := flag.String("o", "", "Out Path")
+
+	// flag.Parse()
+
+	// if *filePath == "" {
+	// 	msg := fmt.Errorf("file required")
+	// 	log.Fatal(msg)
+	// }
+
+	// if *geomPath == "" {
+	// 	msg := fmt.Errorf("geojson required")
+	// 	log.Fatal(msg)
+	// }
+	// if *outPath == "" {
+	// 	msg := fmt.Errorf("out File required")
+	// 	log.Fatal(msg)
+	// }
+	paths, err := readLines("files_outside.txt")
+
+	base := "/Users/erickotenyo/Downloads/Data/ICPAC/LandCover/outside"
+
+	outBase := "/Users/erickotenyo/Downloads/Data/ICPAC/LandCover/clipped"
+
+	geojson := "/Users/erickotenyo/Downloads/Data/shapefiles/GHA Shapefiles/ea_gadm36_countries/ea.geojson"
+
+	ext := ".tif"
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	utils.InitGdal()
+
+	bar := progressbar.Default(int64(len(paths)))
+
+	for _, p := range paths {
+		path := fmt.Sprintf("%s/%s%s", base, p, ext)
+		out := fmt.Sprintf("%s/%s%s", outBase, p, ext)
+		err := Clip(path, geojson, out)
+		if err != nil {
+			log.Fatal(err)
+		}
+		bar.Add(1)
+	}
+
+}
+
+func readLines(path string) (lines []string, err error) {
+	out := make([]string, 0)
+
+	file, err := os.Open(path)
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer file.Close()
+
+	sc := bufio.NewScanner(file)
+
+	// Read through 'tokens' until an EOF is encountered.
+	for sc.Scan() {
+		out = append(out, sc.Text())
+	}
+
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}

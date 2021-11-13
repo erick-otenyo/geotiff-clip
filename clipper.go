@@ -17,6 +17,8 @@ import (
 	"unsafe"
 
 	geo "github.com/nci/geometry"
+
+	"github.com/erick-otenyo/geotiff-clip/utils"
 )
 
 type ClipFileDescriptor struct {
@@ -27,40 +29,51 @@ type ClipFileDescriptor struct {
 	DstGeot []float64
 }
 
+type GeomRasterData struct {
+	DataType    string
+	Data        interface{}
+	ClipDescr   ClipFileDescriptor
+	NoDataValue float64
+}
+
 var cWGS84WKT = C.CString(`GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9108"]],AUTHORITY["EPSG","4326"]]","proj4":"+proj=longlat +ellps=WGS84 +towgs84=0,0,0,0,0,0,0 +no_defs `)
 
-func Clip(filePath string, geojsonPath string, outPath string) error {
+func ParseGeojson(filePath string) (geo.FeatureCollection, error) {
 
-	geojsonFile, err := os.Open(geojsonPath)
+	var featureCol geo.FeatureCollection
+
+	geojsonFile, err := os.Open(filePath)
 
 	if err != nil {
-		return err
+		return featureCol, err
 	}
 
 	defer geojsonFile.Close()
 
 	byteValue, _ := ioutil.ReadAll(geojsonFile)
 
-	var featCol geo.FeatureCollection
-	err = json.Unmarshal(byteValue, &featCol)
+	err = json.Unmarshal(byteValue, &featureCol)
 
 	if err != nil {
-		return fmt.Errorf("problem unmarshalling geometry")
+		return featureCol, fmt.Errorf("problem unmarshalling geometry")
 	}
 
-	feat := featCol.Features[0]
+	return featureCol, nil
+}
 
-	geomGeoJSON, err := json.Marshal(feat.Geometry)
+func ReadDataWithinGeom(feature geo.Feature, filePath string) (*GeomRasterData, error) {
+
+	geomGeoJSON, err := json.Marshal(feature.Geometry)
 
 	if err != nil {
-		return fmt.Errorf("problem marshaling GeoJSON geometry: %v", err)
+		return nil, fmt.Errorf("problem marshaling GeoJSON geometry: %v", err)
 	}
 
 	cPath := C.CString(filePath)
 	defer C.free(unsafe.Pointer(cPath))
 	ds := C.GDALOpen(cPath, C.GDAL_OF_READONLY)
 	if ds == nil {
-		return fmt.Errorf("gdal could not open dataset: %s", filePath)
+		return nil, fmt.Errorf("gdal could not open dataset: %s", filePath)
 	}
 	defer C.GDALClose(ds)
 
@@ -68,7 +81,7 @@ func Clip(filePath string, geojsonPath string, outPath string) error {
 	defer C.free(unsafe.Pointer(cGeom))
 	geom := C.OGR_G_CreateGeometryFromJson(cGeom)
 	if geom == nil {
-		return fmt.Errorf("geometry could not be parsed")
+		return nil, fmt.Errorf("geometry could not be parsed")
 	}
 
 	selSRS := C.OSRNewSpatialReference(cWGS84WKT)
@@ -76,55 +89,79 @@ func Clip(filePath string, geojsonPath string, outPath string) error {
 
 	C.OGR_G_AssignSpatialReference(geom, selSRS)
 
-	readData(ds, geom, outPath)
-
-	return nil
-}
-
-func readData(ds C.GDALDatasetH, geom C.OGRGeometryH, outPath string) error {
-
 	// get mask
 	dsDscr, err := getDrillFileDescriptor(ds, geom, 0, 0)
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// it is safe to assume all data bands have same data type and nodata value
 	bandH := C.GDALGetRasterBand(ds, C.int(1))
 	dType := C.GDALGetRasterDataType(bandH)
+	noData := float64(C.GDALGetRasterNoDataValue(bandH, nil))
 
 	dSize := C.GDALGetDataTypeSizeBytes(dType)
 	if dSize == 0 {
-		return fmt.Errorf("gdal data type not implemented")
+		return nil, fmt.Errorf("gdal data type not implemented")
 	}
 
-	nodata := float32(C.GDALGetRasterNoDataValue(bandH, nil))
+	dTypeName := utils.GetDataType(int(dType))
+
+	if dTypeName == "" {
+		return nil, fmt.Errorf("gdal data type not implemented")
+	}
+
+	geomRasterData := &GeomRasterData{
+		DataType:    dTypeName,
+		ClipDescr:   *dsDscr,
+		NoDataValue: noData,
+	}
 
 	// band 1
 	bandsRead := []int32{1}
 
 	// read band
-	dataBuf := make([]float32, dsDscr.DstBBox[2]*dsDscr.DstBBox[3]*int32(1))
-	C.GDALDatasetRasterIO(ds, C.GF_Read, C.int(dsDscr.SrcBBox[0]), C.int(dsDscr.SrcBBox[1]), C.int(dsDscr.SrcBBox[2]), C.int(dsDscr.SrcBBox[3]), unsafe.Pointer(&dataBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Float32, C.int(1), (*C.int)(unsafe.Pointer(&bandsRead[0])), 0, 0, 0)
-
-	bandSize := int(dsDscr.DstBBox[2] * dsDscr.DstBBox[3])
-
-	// ouput data
-	dataOutBuf := make([]float32, dsDscr.DstBBox[2]*dsDscr.DstBBox[3]*int32(1))
-
-	// reading of the non masked pixels
-	for i := 0; i < bandSize; i++ {
-		var val float32
-		if dsDscr.Mask[i] == 255 {
-			val = dataBuf[i]
-		} else {
-			// this is outside the geometry. Write nodata
-			val = nodata
-		}
-
-		dataOutBuf[i] = val
+	switch dTypeName {
+	case "Byte":
+		dataBuf := make([]uint8, dsDscr.DstBBox[2]*dsDscr.DstBBox[3]*int32(1))
+		C.GDALDatasetRasterIO(ds, C.GF_Read, C.int(dsDscr.SrcBBox[0]), C.int(dsDscr.SrcBBox[1]), C.int(dsDscr.SrcBBox[2]), C.int(dsDscr.SrcBBox[3]), unsafe.Pointer(&dataBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Byte, C.int(1), (*C.int)(unsafe.Pointer(&bandsRead[0])), 0, 0, 0)
+		geomRasterData.Data = dataBuf
+	case "UInt16":
+		dataBuf := make([]uint16, dsDscr.DstBBox[2]*dsDscr.DstBBox[3]*int32(1))
+		C.GDALDatasetRasterIO(ds, C.GF_Read, C.int(dsDscr.SrcBBox[0]), C.int(dsDscr.SrcBBox[1]), C.int(dsDscr.SrcBBox[2]), C.int(dsDscr.SrcBBox[3]), unsafe.Pointer(&dataBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_UInt16, C.int(1), (*C.int)(unsafe.Pointer(&bandsRead[0])), 0, 0, 0)
+		geomRasterData.Data = dataBuf
+	case "Int16":
+		dataBuf := make([]int16, dsDscr.DstBBox[2]*dsDscr.DstBBox[3]*int32(1))
+		C.GDALDatasetRasterIO(ds, C.GF_Read, C.int(dsDscr.SrcBBox[0]), C.int(dsDscr.SrcBBox[1]), C.int(dsDscr.SrcBBox[2]), C.int(dsDscr.SrcBBox[3]), unsafe.Pointer(&dataBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Int16, C.int(1), (*C.int)(unsafe.Pointer(&bandsRead[0])), 0, 0, 0)
+		geomRasterData.Data = dataBuf
+	case "UInt32":
+		dataBuf := make([]uint32, dsDscr.DstBBox[2]*dsDscr.DstBBox[3]*int32(1))
+		C.GDALDatasetRasterIO(ds, C.GF_Read, C.int(dsDscr.SrcBBox[0]), C.int(dsDscr.SrcBBox[1]), C.int(dsDscr.SrcBBox[2]), C.int(dsDscr.SrcBBox[3]), unsafe.Pointer(&dataBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_UInt32, C.int(1), (*C.int)(unsafe.Pointer(&bandsRead[0])), 0, 0, 0)
+		geomRasterData.Data = dataBuf
+	case "Int32":
+		dataBuf := make([]int32, dsDscr.DstBBox[2]*dsDscr.DstBBox[3]*int32(1))
+		C.GDALDatasetRasterIO(ds, C.GF_Read, C.int(dsDscr.SrcBBox[0]), C.int(dsDscr.SrcBBox[1]), C.int(dsDscr.SrcBBox[2]), C.int(dsDscr.SrcBBox[3]), unsafe.Pointer(&dataBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Int32, C.int(1), (*C.int)(unsafe.Pointer(&bandsRead[0])), 0, 0, 0)
+		geomRasterData.Data = dataBuf
+	case "Float32":
+		dataBuf := make([]float32, dsDscr.DstBBox[2]*dsDscr.DstBBox[3]*int32(1))
+		C.GDALDatasetRasterIO(ds, C.GF_Read, C.int(dsDscr.SrcBBox[0]), C.int(dsDscr.SrcBBox[1]), C.int(dsDscr.SrcBBox[2]), C.int(dsDscr.SrcBBox[3]), unsafe.Pointer(&dataBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Float32, C.int(1), (*C.int)(unsafe.Pointer(&bandsRead[0])), 0, 0, 0)
+		geomRasterData.Data = dataBuf
+	case "Float64":
+		dataBuf := make([]float64, dsDscr.DstBBox[2]*dsDscr.DstBBox[3]*int32(1))
+		C.GDALDatasetRasterIO(ds, C.GF_Read, C.int(dsDscr.SrcBBox[0]), C.int(dsDscr.SrcBBox[1]), C.int(dsDscr.SrcBBox[2]), C.int(dsDscr.SrcBBox[3]), unsafe.Pointer(&dataBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Float64, C.int(1), (*C.int)(unsafe.Pointer(&bandsRead[0])), 0, 0, 0)
+		geomRasterData.Data = dataBuf
+	default:
+		return nil, fmt.Errorf("gdal data type not implemented")
 	}
+
+	return geomRasterData, nil
+}
+
+func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string) error {
+	dsDscr := geomData.ClipDescr
+	bandSize := int(dsDscr.DstBBox[2] * dsDscr.DstBBox[3])
+	bandStrides := 1
 
 	var geot []float64
 
@@ -155,11 +192,252 @@ func readData(ds C.GDALDatasetH, geom C.OGRGeometryH, outPath string) error {
 
 	driverOptions = append(driverOptions, nil)
 
-	hDs := C.GDALCreate(hDriver, outFileC, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), 1, C.GDT_Float32, &driverOptions[0])
+	var hDs C.GDALDatasetH
 
-	if hDs == nil {
-		os.Remove(outPath)
-		return fmt.Errorf("error creating raster")
+	gerr := C.CPLErr(0)
+
+	switch geomData.DataType {
+	case "Byte":
+		dataOutBuf := make([]uint8, bandSize*bandStrides)
+		inData := geomData.Data.([]uint8)
+		// no data
+		if len(inData) < 1 {
+			return fmt.Errorf("no data to write")
+		}
+		// reading of the non masked pixels
+		for i := 0; i < bandSize; i++ {
+			var val uint8
+			if dsDscr.Mask[i] == 255 {
+				val = inData[i]
+			} else {
+				// this is outside the geometry. Write nodata
+				val = uint8(geomData.NoDataValue)
+			}
+			dataOutBuf[i] = val
+		}
+
+		hDs = C.GDALCreate(hDriver, outFileC, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), 1, C.GDT_Byte, &driverOptions[0])
+		if hDs == nil {
+			os.Remove(outPath)
+			return fmt.Errorf("error creating raster")
+		}
+		hBand := C.GDALGetRasterBand(hDs, C.int(1))
+		// set no data value
+		C.GDALSetRasterNoDataValue(hBand, C.double(geomData.NoDataValue))
+		// write band data
+		gerr = C.GDALRasterIO(hBand, C.GF_Write, 0, 0, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), unsafe.Pointer(&dataOutBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Byte, 0, 0)
+
+		if gerr != 0 {
+			C.GDALClose(hDs)
+			return fmt.Errorf("error writing raster band")
+		}
+
+	case "UInt16":
+		dataOutBuf := make([]uint16, bandSize*bandStrides)
+		inData := geomData.Data.([]uint16)
+
+		// no data
+		if len(inData) < 1 {
+			return fmt.Errorf("no data to write")
+		}
+
+		for i := 0; i < bandSize; i++ {
+			var val uint16
+			if dsDscr.Mask[i] == 255 {
+				val = inData[i]
+			} else {
+				// this is outside the geometry. Write nodata
+				val = uint16(geomData.NoDataValue)
+			}
+			dataOutBuf[i] = val
+		}
+
+		hDs = C.GDALCreate(hDriver, outFileC, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), 1, C.GDT_UInt16, &driverOptions[0])
+		if hDs == nil {
+			os.Remove(outPath)
+			return fmt.Errorf("error creating raster")
+		}
+		hBand := C.GDALGetRasterBand(hDs, C.int(1))
+		// set no data value
+		C.GDALSetRasterNoDataValue(hBand, C.double(geomData.NoDataValue))
+		// write band data
+		gerr = C.GDALRasterIO(hBand, C.GF_Write, 0, 0, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), unsafe.Pointer(&dataOutBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_UInt16, 0, 0)
+
+		if gerr != 0 {
+			C.GDALClose(hDs)
+			return fmt.Errorf("error writing raster band")
+		}
+	case "Int16":
+		dataOutBuf := make([]int16, bandSize*bandStrides)
+		inData := geomData.Data.([]int16)
+
+		// no data
+		if len(inData) < 1 {
+			return fmt.Errorf("no data to write")
+		}
+
+		for i := 0; i < bandSize; i++ {
+			var val int16
+			if dsDscr.Mask[i] == 255 {
+				val = inData[i]
+			} else {
+				// this is outside the geometry. Write nodata
+				val = int16(geomData.NoDataValue)
+			}
+			dataOutBuf[i] = val
+		}
+
+		hDs = C.GDALCreate(hDriver, outFileC, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), 1, C.GDT_Int16, &driverOptions[0])
+		if hDs == nil {
+			os.Remove(outPath)
+			return fmt.Errorf("error creating raster")
+		}
+		hBand := C.GDALGetRasterBand(hDs, C.int(1))
+		// set no data value
+		C.GDALSetRasterNoDataValue(hBand, C.double(geomData.NoDataValue))
+		// write band data
+		gerr = C.GDALRasterIO(hBand, C.GF_Write, 0, 0, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), unsafe.Pointer(&dataOutBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Int16, 0, 0)
+
+		if gerr != 0 {
+			C.GDALClose(hDs)
+			return fmt.Errorf("error writing raster band")
+		}
+	case "UInt32":
+		dataOutBuf := make([]uint32, bandSize*bandStrides)
+		inData := geomData.Data.([]uint32)
+		// no data
+		if len(inData) < 1 {
+			return fmt.Errorf("no data to write")
+		}
+
+		for i := 0; i < bandSize; i++ {
+			var val uint32
+			if dsDscr.Mask[i] == 255 {
+				val = inData[i]
+			} else {
+				// this is outside the geometry. Write nodata
+				val = uint32(geomData.NoDataValue)
+			}
+			dataOutBuf[i] = val
+		}
+
+		hDs = C.GDALCreate(hDriver, outFileC, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), 1, C.GDT_UInt32, &driverOptions[0])
+		if hDs == nil {
+			os.Remove(outPath)
+			return fmt.Errorf("error creating raster")
+		}
+		hBand := C.GDALGetRasterBand(hDs, C.int(1))
+		// set no data value
+		C.GDALSetRasterNoDataValue(hBand, C.double(geomData.NoDataValue))
+		// write band data
+		gerr = C.GDALRasterIO(hBand, C.GF_Write, 0, 0, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), unsafe.Pointer(&dataOutBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_UInt32, 0, 0)
+
+		if gerr != 0 {
+			C.GDALClose(hDs)
+			return fmt.Errorf("error writing raster band")
+		}
+
+	case "Int32":
+		dataOutBuf := make([]int32, bandSize*bandStrides)
+		inData := geomData.Data.([]int32)
+		// no data
+		if len(inData) < 1 {
+			return fmt.Errorf("no data to write")
+		}
+		for i := 0; i < bandSize; i++ {
+			var val int32
+			if dsDscr.Mask[i] == 255 {
+				val = inData[i]
+			} else {
+				// this is outside the geometry. Write nodata
+				val = int32(geomData.NoDataValue)
+			}
+			dataOutBuf[i] = val
+		}
+
+		hDs = C.GDALCreate(hDriver, outFileC, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), 1, C.GDT_Int32, &driverOptions[0])
+		if hDs == nil {
+			os.Remove(outPath)
+			return fmt.Errorf("error creating raster")
+		}
+		hBand := C.GDALGetRasterBand(hDs, C.int(1))
+		// set no data value
+		C.GDALSetRasterNoDataValue(hBand, C.double(geomData.NoDataValue))
+		// write band data
+		gerr = C.GDALRasterIO(hBand, C.GF_Write, 0, 0, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), unsafe.Pointer(&dataOutBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Int32, 0, 0)
+
+		if gerr != 0 {
+			C.GDALClose(hDs)
+			return fmt.Errorf("error writing raster band")
+		}
+
+	case "Float32":
+		dataOutBuf := make([]float32, bandSize*bandStrides)
+		inData := geomData.Data.([]float32)
+		// no data
+		if len(inData) < 1 {
+			return fmt.Errorf("no data to write")
+		}
+		for i := 0; i < bandSize; i++ {
+			var val float32
+			if dsDscr.Mask[i] == 255 {
+				val = inData[i]
+			} else {
+				// this is outside the geometry. Write nodata
+				val = float32(geomData.NoDataValue)
+			}
+			dataOutBuf[i] = val
+		}
+		hDs = C.GDALCreate(hDriver, outFileC, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), 1, C.GDT_Float32, &driverOptions[0])
+		if hDs == nil {
+			os.Remove(outPath)
+			return fmt.Errorf("error creating raster")
+		}
+		hBand := C.GDALGetRasterBand(hDs, C.int(1))
+		// set no data value
+		C.GDALSetRasterNoDataValue(hBand, C.double(geomData.NoDataValue))
+		// write band data
+		gerr = C.GDALRasterIO(hBand, C.GF_Write, 0, 0, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), unsafe.Pointer(&dataOutBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Float32, 0, 0)
+
+		if gerr != 0 {
+			C.GDALClose(hDs)
+			return fmt.Errorf("error writing raster band")
+		}
+	case "Float64":
+		dataOutBuf := make([]float64, bandSize*bandStrides)
+		inData := geomData.Data.([]float64)
+		// no data
+		if len(inData) < 1 {
+			return fmt.Errorf("no data to write")
+		}
+		for i := 0; i < bandSize; i++ {
+			var val float64
+			if dsDscr.Mask[i] == 255 {
+				val = inData[i]
+			} else {
+				// this is outside the geometry. Write nodata
+				val = float64(geomData.NoDataValue)
+			}
+			dataOutBuf[i] = val
+		}
+
+		hDs = C.GDALCreate(hDriver, outFileC, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), 1, C.GDT_Float64, &driverOptions[0])
+		if hDs == nil {
+			os.Remove(outPath)
+			return fmt.Errorf("error creating raster")
+		}
+		hBand := C.GDALGetRasterBand(hDs, C.int(1))
+		// set no data value
+		C.GDALSetRasterNoDataValue(hBand, C.double(geomData.NoDataValue))
+		// write band data
+		gerr = C.GDALRasterIO(hBand, C.GF_Write, 0, 0, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), unsafe.Pointer(&dataOutBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Float64, 0, 0)
+
+		if gerr != 0 {
+			C.GDALClose(hDs)
+			return fmt.Errorf("error writing raster band")
+		}
+	default:
+		return fmt.Errorf("unknown data type %s", geomData.DataType)
 	}
 
 	// Set projection
@@ -171,26 +449,8 @@ func readData(ds C.GDALDatasetH, geom C.OGRGeometryH, outPath string) error {
 	C.OSRExportToWkt(hSRS, &projWKT)
 	C.GDALSetProjection(hDs, projWKT)
 
-	hBand := C.GDALGetRasterBand(hDs, C.int(1))
-	gerr := C.CPLErr(0)
-
 	// Set geotransform
 	C.GDALSetGeoTransform(hDs, (*C.double)(&geot[0]))
-
-	// set no data value
-	C.GDALSetRasterNoDataValue(hBand, C.double(nodata))
-
-	if gerr != 0 {
-		return fmt.Errorf("Error")
-	}
-
-	// write band data
-	gerr = C.GDALRasterIO(hBand, C.GF_Write, 0, 0, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), unsafe.Pointer(&dataOutBuf[0]), C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), C.GDT_Float32, 0, 0)
-
-	if gerr != 0 {
-		C.GDALClose(hDs)
-		return fmt.Errorf("rrror writing raster band")
-	}
 
 	// close dataset
 	C.GDALClose(hDs)
