@@ -1,2 +1,6 @@
 *.tif
 *.geojson
+
+data/
+
+.DS_Store

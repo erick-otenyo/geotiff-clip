@@ -14,12 +14,17 @@ import (
 	"io/ioutil"
 	"math"
 	"os"
+	"time"
 	"unsafe"
 
 	geo "github.com/nci/geometry"
 
 	"github.com/erick-otenyo/geotiff-clip/utils"
 )
+
+var cWGS85MercatorWKT = C.CString(`PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]],PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Easting",EAST],AXIS["Northing",NORTH],EXTENSION["PROJ4","+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs"],AUTHORITY["EPSG","3857"]]`)
+
+const ISOFormat = "2006-01-02T15:04:05.000Z"
 
 type ClipFileDescriptor struct {
 	SrcBBox []int32
@@ -34,6 +39,51 @@ type GeomRasterData struct {
 	Data        interface{}
 	ClipDescr   ClipFileDescriptor
 	NoDataValue float64
+}
+
+type DatasetAxis struct {
+	Name               string    `json:"name"`
+	Params             []float64 `json:"params"`
+	Strides            []int     `json:"strides"`
+	Shape              []int     `json:"shape"`
+	Grid               string    `json:"grid"`
+	IntersectionIdx    []int
+	IntersectionValues []float64
+	Order              int
+	Aggregate          int
+}
+
+type GeoLocInfo struct {
+	XDSName     string `json:"x_ds_name"`
+	XBand       int    `json:"x_band"`
+	YDSName     string `json:"y_ds_name"`
+	YBand       int    `json:"y_band"`
+	LineOffset  int    `json:"line_offset"`
+	PixelOffset int    `json:"pixel_offset"`
+	LineStep    int    `json:"line_step"`
+	PixelStep   int    `json:"pixel_step"`
+}
+
+type GDALDataset struct {
+	RawPath      string         `json:"file_path"`
+	DSName       string         `json:"ds_name"`
+	NameSpace    string         `json:"namespace"`
+	ArrayType    string         `json:"array_type"`
+	SRS          string         `json:"srs"`
+	GeoTransform []float64      `json:"geo_transform"`
+	TimeStamps   []time.Time    `json:"timestamps"`
+	Polygon      string         `json:"polygon"`
+	Means        []float64      `json:"means"`
+	SampleCounts []int          `json:"sample_counts"`
+	NoData       float64        `json:"nodata"`
+	Axes         []*DatasetAxis `json:"axes"`
+	GeoLocation  *GeoLocInfo    `json:"geo_loc"`
+	IsOutRange   bool
+}
+
+type MetadataResponse struct {
+	Error        string         `json:"error"`
+	GDALDatasets []*GDALDataset `json:"gdal"`
 }
 
 var cWGS84WKT = C.CString(`GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9108"]],AUTHORITY["EPSG","4326"]]","proj4":"+proj=longlat +ellps=WGS84 +towgs84=0,0,0,0,0,0,0 +no_defs `)
@@ -158,7 +208,217 @@ func ReadDataWithinGeom(feature geo.Feature, filePath string) (*GeomRasterData, 
 	return geomRasterData, nil
 }
 
-func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string) error {
+func CreatGeomMask(feature geo.Feature, filePath string, inverse bool) (*GeomRasterData, error) {
+
+	geomGeoJSON, err := json.Marshal(feature.Geometry)
+
+	if err != nil {
+		return nil, fmt.Errorf("problem marshaling GeoJSON geometry: %v", err)
+	}
+
+	cPath := C.CString(filePath)
+	defer C.free(unsafe.Pointer(cPath))
+	ds := C.GDALOpen(cPath, C.GDAL_OF_READONLY)
+	if ds == nil {
+		return nil, fmt.Errorf("gdal could not open dataset: %s", filePath)
+	}
+	defer C.GDALClose(ds)
+
+	cGeom := C.CString(string(geomGeoJSON))
+	defer C.free(unsafe.Pointer(cGeom))
+	geom := C.OGR_G_CreateGeometryFromJson(cGeom)
+	if geom == nil {
+		return nil, fmt.Errorf("geometry could not be parsed")
+	}
+
+	selSRS := C.OSRNewSpatialReference(cWGS84WKT)
+	defer C.OSRDestroySpatialReference(selSRS)
+
+	C.OGR_G_AssignSpatialReference(geom, selSRS)
+
+	gCopy := C.OGR_G_Buffer(geom, C.double(0.0), C.int(30))
+	if C.OGR_G_IsEmpty(gCopy) == C.int(1) {
+		gCopy = C.OGR_G_Clone(geom)
+	}
+
+	defer C.OGR_G_DestroyGeometry(gCopy)
+
+	if C.GoString(C.GDALGetProjectionRef(ds)) != "" {
+		desSRS := C.OSRNewSpatialReference(C.GDALGetProjectionRef(ds))
+		defer C.OSRDestroySpatialReference(desSRS)
+		srcSRS := C.OSRNewSpatialReference(cWGS84WKT)
+		defer C.OSRDestroySpatialReference(srcSRS)
+		C.OSRSetAxisMappingStrategy(srcSRS, C.OAMS_TRADITIONAL_GIS_ORDER)
+		C.OSRSetAxisMappingStrategy(desSRS, C.OAMS_TRADITIONAL_GIS_ORDER)
+		trans := C.OCTNewCoordinateTransformation(srcSRS, desSRS)
+		C.OGR_G_Transform(gCopy, trans)
+		C.OCTDestroyCoordinateTransformation(trans)
+	}
+
+	geot := make([]float64, 6)
+	gdalErr := C.GDALGetGeoTransform(ds, (*C.double)(&geot[0]))
+	if gdalErr != 0 {
+		return nil, fmt.Errorf("couldn't get the geotransform from the source dataset %v", gdalErr)
+	}
+
+	xSize := int32(float64(C.GDALGetRasterXSize(ds)) + 0.5)
+	ySize := int32(float64(C.GDALGetRasterYSize(ds)) + 0.5)
+
+	if err != nil {
+		return nil, err
+	}
+
+	srcBBox := []int32{0, 0, xSize, ySize}
+
+	mask, err := createMask(ds, gCopy, geot, srcBBox)
+
+	if err != nil {
+		return nil, err
+	}
+
+	dsDscr := &ClipFileDescriptor{srcBBox, srcBBox, mask, geot, []float64{}}
+
+	geomRasterData := &GeomRasterData{
+		DataType:    "Byte",
+		ClipDescr:   *dsDscr,
+		NoDataValue: 0,
+	}
+
+	if inverse {
+		out := make([]uint8, len(mask))
+		for i, m := range mask {
+			if m == 255 {
+				out[i] = uint8(0)
+			} else {
+				out[i] = uint8(255)
+			}
+		}
+		geomRasterData.Data = out
+		geomRasterData.NoDataValue = 255
+
+		return geomRasterData, nil
+	}
+
+	geomRasterData.Data = mask
+
+	return geomRasterData, nil
+}
+
+func CreatVisMemGeomMask(feature geo.Feature, crs string, width int32, height int32, geot []float64) error {
+	filePath, err := CreatVisMem(crs, []int32{width, height}, geot)
+
+	if err != nil {
+		return err
+	}
+
+	cPath := C.CString(*filePath)
+	defer C.free(unsafe.Pointer(cPath))
+
+	ds := C.GDALOpen(cPath, C.GA_Update)
+	if ds == nil {
+		return fmt.Errorf("gdal could not open dataset: %s", *filePath)
+	}
+	defer C.GDALClose(ds)
+
+	geomData, err := CreatGeomMask(feature, *filePath, true)
+
+	if err != nil {
+		return err
+	}
+
+	path := "/vsimem/mem_inter.tif"
+
+	err = WriteDataToGeoTiff(geomData, path, false)
+
+	if err != nil {
+		return err
+	}
+
+	timestamp, err := time.Parse(ISOFormat, "2021-11-30T00:00:00Z")
+
+	if err != nil {
+		return err
+	}
+
+	yMax := geomData.ClipDescr.SrcGeot[3]
+
+	xPixel := geomData.ClipDescr.SrcGeot[2]
+	yPixel := geomData.ClipDescr.SrcGeot[5]
+
+	xMin := geomData.ClipDescr.SrcGeot[0]
+	xMax := xMin + float64(geomData.ClipDescr.DstBBox[2])*xPixel
+	yMin := yMax + float64(geomData.ClipDescr.DstBBox[3])*yPixel
+
+	wktPolygon := fmt.Sprintf(`POLYGON((%[1]f %[2]f, %[1]f %[4]f, %[2]f %[4]f, %[3]f %[2]f, %[1]f %[2]f))`, xMin, yMin, xMax, yMax)
+
+	gdalDataset := GDALDataset{
+		RawPath:      path,
+		DSName:       path,
+		NameSpace:    "pixelmask",
+		ArrayType:    "Byte",
+		SRS:          C.GoString(cWGS85MercatorWKT),
+		GeoTransform: geomData.ClipDescr.DstGeot,
+		TimeStamps:   []time.Time{timestamp},
+		Axes:         nil,
+		NoData:       255,
+		GeoLocation:  nil,
+		Polygon:      wktPolygon,
+	}
+
+	metadata := MetadataResponse{
+		GDALDatasets: []*GDALDataset{
+			&gdalDataset,
+		},
+	}
+
+	return nil
+}
+
+func CreatVisMem(crs string, bbox []int32, geot []float64) (*string, error) {
+	canvas := make([]uint8, bbox[0]*bbox[1])
+
+	memStr := fmt.Sprintf("MEM:::DATAPOINTER=%d,PIXELS=%d,LINES=%d,DATATYPE=Byte", unsafe.Pointer(&canvas[0]), bbox[0], bbox[1])
+	memStrC := C.CString(memStr)
+	defer C.free(unsafe.Pointer(memStrC))
+	hSrcDS := C.GDALOpen(memStrC, C.GA_Update)
+	if hSrcDS == nil {
+		return nil, fmt.Errorf("error creating memory dataset")
+	}
+	defer C.GDALClose(hSrcDS)
+
+	hSRS := C.OSRNewSpatialReference(nil)
+	defer C.OSRDestroySpatialReference(hSRS)
+	C.OSRImportFromEPSG(hSRS, C.int(3857))
+	var projWKT *C.char
+	defer C.free(unsafe.Pointer(projWKT))
+	C.OSRExportToWkt(hSRS, &projWKT)
+	C.GDALSetProjection(hSrcDS, projWKT)
+
+	var gdalErr C.CPLErr
+
+	if gdalErr = C.GDALSetGeoTransform(hSrcDS, (*C.double)(&geot[0])); gdalErr != 0 {
+		return nil, fmt.Errorf("couldn't set the geotransform on the destination dataset %v", gdalErr)
+	}
+
+	driverStr := C.CString("GTiff")
+	defer C.free(unsafe.Pointer(driverStr))
+	hDriver := C.GDALGetDriverByName(driverStr)
+
+	outFileStr := fmt.Sprintf("/vsimem/%d_%d.tif", bbox[0], bbox[1])
+	outFileC := C.CString(outFileStr)
+	defer C.free(unsafe.Pointer(outFileC))
+
+	hDstDS := C.GDALCreateCopy(hDriver, outFileC, hSrcDS, C.int(0), nil, nil, nil)
+
+	if hDstDS != nil {
+		return &outFileStr, nil
+	}
+
+	return nil, fmt.Errorf("error creating memory raster")
+
+}
+
+func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string, applyMask bool) error {
 	dsDscr := geomData.ClipDescr
 	bandSize := int(dsDscr.DstBBox[2] * dsDscr.DstBBox[3])
 	bandStrides := 1
@@ -206,12 +466,14 @@ func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string) error {
 		}
 		// reading of the non masked pixels
 		for i := 0; i < bandSize; i++ {
-			var val uint8
-			if dsDscr.Mask[i] == 255 {
-				val = inData[i]
-			} else {
-				// this is outside the geometry. Write nodata
-				val = uint8(geomData.NoDataValue)
+			val := inData[i]
+			if applyMask {
+				if dsDscr.Mask[i] == 255 {
+					val = inData[i]
+				} else {
+					// this is outside the geometry. Write nodata
+					val = uint8(geomData.NoDataValue)
+				}
 			}
 			dataOutBuf[i] = val
 		}
@@ -242,13 +504,17 @@ func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string) error {
 		}
 
 		for i := 0; i < bandSize; i++ {
-			var val uint16
-			if dsDscr.Mask[i] == 255 {
-				val = inData[i]
-			} else {
-				// this is outside the geometry. Write nodata
-				val = uint16(geomData.NoDataValue)
+			val := inData[i]
+
+			if applyMask {
+				if dsDscr.Mask[i] == 255 {
+					val = inData[i]
+				} else {
+					// this is outside the geometry. Write nodata
+					val = uint16(geomData.NoDataValue)
+				}
 			}
+
 			dataOutBuf[i] = val
 		}
 
@@ -277,13 +543,17 @@ func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string) error {
 		}
 
 		for i := 0; i < bandSize; i++ {
-			var val int16
-			if dsDscr.Mask[i] == 255 {
-				val = inData[i]
-			} else {
-				// this is outside the geometry. Write nodata
-				val = int16(geomData.NoDataValue)
+			val := inData[i]
+
+			if applyMask {
+				if dsDscr.Mask[i] == 255 {
+					val = inData[i]
+				} else {
+					// this is outside the geometry. Write nodata
+					val = int16(geomData.NoDataValue)
+				}
 			}
+
 			dataOutBuf[i] = val
 		}
 
@@ -311,13 +581,17 @@ func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string) error {
 		}
 
 		for i := 0; i < bandSize; i++ {
-			var val uint32
-			if dsDscr.Mask[i] == 255 {
-				val = inData[i]
-			} else {
-				// this is outside the geometry. Write nodata
-				val = uint32(geomData.NoDataValue)
+			val := inData[i]
+
+			if applyMask {
+				if dsDscr.Mask[i] == 255 {
+					val = inData[i]
+				} else {
+					// this is outside the geometry. Write nodata
+					val = uint32(geomData.NoDataValue)
+				}
 			}
+
 			dataOutBuf[i] = val
 		}
 
@@ -345,13 +619,17 @@ func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string) error {
 			return fmt.Errorf("no data to write")
 		}
 		for i := 0; i < bandSize; i++ {
-			var val int32
-			if dsDscr.Mask[i] == 255 {
-				val = inData[i]
-			} else {
-				// this is outside the geometry. Write nodata
-				val = int32(geomData.NoDataValue)
+			val := inData[i]
+
+			if applyMask {
+				if dsDscr.Mask[i] == 255 {
+					val = inData[i]
+				} else {
+					// this is outside the geometry. Write nodata
+					val = int32(geomData.NoDataValue)
+				}
 			}
+
 			dataOutBuf[i] = val
 		}
 
@@ -379,13 +657,17 @@ func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string) error {
 			return fmt.Errorf("no data to write")
 		}
 		for i := 0; i < bandSize; i++ {
-			var val float32
-			if dsDscr.Mask[i] == 255 {
-				val = inData[i]
-			} else {
-				// this is outside the geometry. Write nodata
-				val = float32(geomData.NoDataValue)
+			val := inData[i]
+
+			if applyMask {
+				if dsDscr.Mask[i] == 255 {
+					val = inData[i]
+				} else {
+					// this is outside the geometry. Write nodata
+					val = float32(geomData.NoDataValue)
+				}
 			}
+
 			dataOutBuf[i] = val
 		}
 		hDs = C.GDALCreate(hDriver, outFileC, C.int(dsDscr.DstBBox[2]), C.int(dsDscr.DstBBox[3]), 1, C.GDT_Float32, &driverOptions[0])
@@ -411,13 +693,17 @@ func WriteDataToGeoTiff(geomData *GeomRasterData, outPath string) error {
 			return fmt.Errorf("no data to write")
 		}
 		for i := 0; i < bandSize; i++ {
-			var val float64
-			if dsDscr.Mask[i] == 255 {
-				val = inData[i]
-			} else {
-				// this is outside the geometry. Write nodata
-				val = float64(geomData.NoDataValue)
+			val := inData[i]
+
+			if applyMask {
+				if dsDscr.Mask[i] == 255 {
+					val = inData[i]
+				} else {
+					// this is outside the geometry. Write nodata
+					val = float64(geomData.NoDataValue)
+				}
 			}
+
 			dataOutBuf[i] = val
 		}
 
